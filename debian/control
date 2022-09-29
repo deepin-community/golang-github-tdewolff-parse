@@ -1,0 +1,33 @@
+Source: golang-github-tdewolff-parse
+Maintainer: Debian Go Packaging Team <team+pkg-go@tracker.debian.org>
+Uploaders: Anthony Fok <foka@debian.org>
+Section: golang
+Testsuite: autopkgtest-pkg-go
+Priority: optional
+Build-Depends: debhelper-compat (= 13),
+               dh-golang,
+               golang-any,
+               golang-github-tdewolff-test-dev (>= 1.0.6)
+Standards-Version: 4.6.0
+Vcs-Browser: https://salsa.debian.org/go-team/packages/golang-github-tdewolff-parse
+Vcs-Git: https://salsa.debian.org/go-team/packages/golang-github-tdewolff-parse.git
+Homepage: https://github.com/tdewolff/parse
+Rules-Requires-Root: no
+XS-Go-Import-Path: github.com/tdewolff/parse
+
+Package: golang-github-tdewolff-parse-dev
+Architecture: all
+Multi-Arch: foreign
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         golang-github-tdewolff-test-dev (>= 1.0.6)
+Description: Go parsers for web formats
+ This package contains several lexers and parsers written in Go.
+ All subpackages are built to be streaming, high performance
+ and to be in accordance with the official (latest) specifications.
+ .
+ The lexers are implemented using buffer.Lexer in
+ https://github.com/tdewolff/parse/buffer and the parsers work on top of
+ the lexers. Some subpackages have hashes defined (using Hasher
+ https://github.com/tdewolff/hasher) that speed up common
+ byte-slice comparisons.
