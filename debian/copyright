@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: parse
 Source: https://github.com/tdewolff/parse
+Upstream-Name: parse
 
 Files: *
 Copyright: 2014 Taco de Wolff

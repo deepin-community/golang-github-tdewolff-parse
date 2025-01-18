@@ -3,18 +3,25 @@ package js
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"strconv"
+	"strings"
+
+	"github.com/tdewolff/parse/v2"
 )
 
 var ErrInvalidJSON = fmt.Errorf("invalid JSON")
 
-// AST is the full ECMAScript abstract syntax tree.
-type AST struct {
-	Comments  [][]byte // first comments in file
-	BlockStmt          // module
+type JSONer interface {
+	JSON(io.Writer) error
 }
 
-func (ast *AST) String() string {
+// AST is the full ECMAScript abstract syntax tree.
+type AST struct {
+	BlockStmt // module
+}
+
+func (ast AST) String() string {
 	s := ""
 	for i, item := range ast.BlockStmt.List {
 		if i != 0 {
@@ -23,6 +30,56 @@ func (ast *AST) String() string {
 		s += item.String()
 	}
 	return s
+}
+
+// JS writes JavaScript to writer.
+func (ast AST) JS(w io.Writer) {
+	for i, item := range ast.List {
+		if i != 0 {
+			w.Write([]byte("\n"))
+		}
+		item.JS(w)
+		if _, ok := item.(*VarDecl); ok {
+			w.Write([]byte(";"))
+		}
+	}
+}
+
+// JSONString returns a string of JavaScript.
+func (ast AST) JSString() string {
+	sb := strings.Builder{}
+	ast.JS(&sb)
+	return sb.String()
+}
+
+// JSON writes JSON to writer.
+func (ast AST) JSON(w io.Writer) error {
+	if 1 < len(ast.List) {
+		return fmt.Errorf("%v: JS must be a single statement", ErrInvalidJSON)
+	} else if len(ast.List) == 0 {
+		return nil
+	}
+	exprStmt, ok := ast.List[0].(*ExprStmt)
+	if !ok {
+		return fmt.Errorf("%v: JS must be an expression statement", ErrInvalidJSON)
+	}
+	expr := exprStmt.Value
+	if group, ok := expr.(*GroupExpr); ok {
+		expr = group.X // allow parsing expr contained in group expr
+	}
+	if val, ok := expr.(JSONer); !ok {
+		return fmt.Errorf("%v: JS must be a valid JSON expression", ErrInvalidJSON)
+	} else {
+		return val.JSON(w)
+	}
+	return nil
+}
+
+// JSONString returns a string of JSON if valid.
+func (ast AST) JSONString() (string, error) {
+	sb := strings.Builder{}
+	err := ast.JSON(&sb)
+	return sb.String(), err
 }
 
 ////////////////////////////////////////////////////////////////
@@ -77,18 +134,26 @@ func (v *Var) Name() []byte {
 	return v.Data
 }
 
+func (v *Var) Info() string {
+	s := fmt.Sprintf("%p type=%s name='%s' uses=%d", v, v.Decl, string(v.Data), v.Uses)
+	links := 0
+	for v.Link != nil {
+		v = v.Link
+		links++
+	}
+	if 0 < links {
+		s += fmt.Sprintf(" links=%d => %p", links, v)
+	}
+	return s
+}
+
 func (v Var) String() string {
 	return string(v.Name())
 }
 
-// JS converts the node back to valid JavaScript
-func (v Var) JS() string {
-	return v.String()
-}
-
-// JSON converts the node back to valid JSON
-func (n Var) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (v Var) JS(w io.Writer) {
+	w.Write(v.Name())
 }
 
 // VarsByUses is sortable by uses in descending order.
@@ -129,12 +194,13 @@ func (vs VarArray) String() string {
 
 // Scope is a function or block scope with a list of variables declared and used.
 type Scope struct {
-	Parent, Func   *Scope   // Parent is nil for global scope, Parent equals Func for function scope
+	Parent, Func   *Scope   // Parent is nil for global scope
 	Declared       VarArray // Link in Var are always nil
 	Undeclared     VarArray
-	NumVarDecls    uint16 // number of variable declaration statements in a function scope
-	NumForInit     uint16 // offset into Declared to mark variables used in for initializer
-	NumArguments   uint16 // offset into Undeclared to mark variables used in arguments
+	VarDecls       []*VarDecl
+	NumForDecls    uint16 // offset into Declared to mark variables used in for statements
+	NumFuncArgs    uint16 // offset into Declared to mark variables used in function arguments
+	NumArgUses     uint16 // offset into Undeclared to mark variables used in arguments
 	IsGlobalOrFunc bool
 	HasWith        bool
 }
@@ -161,8 +227,8 @@ func (s *Scope) Declare(decl DeclType, name []byte) (*Var, bool) {
 
 	if v := s.findDeclared(name, true); v != nil {
 		// variable already declared, might be an error or a duplicate declaration
-		if (LexicalDecl <= v.Decl || LexicalDecl <= decl) && v.Decl != ExprDecl {
-			// redeclaration of let, const, class on an already declared name is an error, except if the declared name is a function expression name
+		if (ArgumentDecl < v.Decl || FunctionDecl < decl) && v.Decl != ExprDecl {
+			// only allow (v.Decl,decl) of: (var|function|argument,var|function), (expr,*), any other combination is a syntax error
 			return nil, false
 		}
 		if v.Decl == ExprDecl {
@@ -170,7 +236,7 @@ func (s *Scope) Declare(decl DeclType, name []byte) (*Var, bool) {
 		}
 		v.Uses++
 		for s != curScope {
-			curScope.addUndeclared(v) // add variable declaration as used variable to the current scope
+			curScope.AddUndeclared(v) // add variable declaration as used variable to the current scope
 			curScope = curScope.Parent
 		}
 		return v, true
@@ -179,12 +245,12 @@ func (s *Scope) Declare(decl DeclType, name []byte) (*Var, bool) {
 	var v *Var
 	// reuse variable if previously used, as in:  a;var a
 	if decl != ArgumentDecl { // in case of function f(a=b,b), where the first b is different from the second
-		for i, uv := range s.Undeclared[s.NumArguments:] {
+		for i, uv := range s.Undeclared[s.NumArgUses:] {
 			// no need to evaluate v.Link as v.Data stays the same and Link is nil in the active scope
 			if 0 < uv.Uses && uv.Decl == NoDecl && bytes.Equal(name, uv.Data) {
 				// must be NoDecl so that it can't be a var declaration that has been added
 				v = uv
-				s.Undeclared = append(s.Undeclared[:int(s.NumArguments)+i], s.Undeclared[int(s.NumArguments)+i+1:]...)
+				s.Undeclared = append(s.Undeclared[:int(s.NumArgUses)+i], s.Undeclared[int(s.NumArgUses)+i+1:]...)
 				break
 			}
 		}
@@ -198,7 +264,7 @@ func (s *Scope) Declare(decl DeclType, name []byte) (*Var, bool) {
 	v.Uses++
 	s.Declared = append(s.Declared, v)
 	for s != curScope {
-		curScope.addUndeclared(v) // add variable declaration as used variable to the current scope
+		curScope.AddUndeclared(v) // add variable declaration as used variable to the current scope
 		curScope = curScope.Parent
 	}
 	return v, true
@@ -222,11 +288,11 @@ func (s *Scope) Use(name []byte) *Var {
 }
 
 // findDeclared finds a declared variable in the current scope.
-func (s *Scope) findDeclared(name []byte, skipForInit bool) *Var {
+func (s *Scope) findDeclared(name []byte, skipForDeclared bool) *Var {
 	start := 0
-	if skipForInit {
+	if skipForDeclared {
 		// we skip the for initializer for declarations (only has effect for let/const)
-		start = int(s.NumForInit)
+		start = int(s.NumForDecls)
 	}
 	// reverse order to find the inner let first in `for(let a in []){let a; {a}}`
 	for i := len(s.Declared) - 1; start <= i; i-- {
@@ -251,7 +317,7 @@ func (s *Scope) findUndeclared(name []byte) *Var {
 }
 
 // add undeclared variable to scope, this is called for the block scope when declaring a var in it
-func (s *Scope) addUndeclared(v *Var) {
+func (s *Scope) AddUndeclared(v *Var) {
 	// don't add undeclared symbol if it's already there
 	for _, vorig := range s.Undeclared {
 		if v == vorig {
@@ -261,14 +327,16 @@ func (s *Scope) addUndeclared(v *Var) {
 	s.Undeclared = append(s.Undeclared, v) // add variable declaration as used variable to the current scope
 }
 
-// MarkForInit marks the declared variables in current scope as for statement initializer to distinguish from declarations in body.
-func (s *Scope) MarkForInit() {
-	s.NumForInit = uint16(len(s.Declared))
+// MarkForStmt marks the declared variables in current scope as for statement initializer to distinguish from declarations in body.
+func (s *Scope) MarkForStmt() {
+	s.NumForDecls = uint16(len(s.Declared))
+	s.NumArgUses = uint16(len(s.Undeclared)) // ensures for different b's in for(var a in b){let b}
 }
 
-// MarkArguments marks the undeclared variables in the current scope as function arguments. It ensures different b's in `function f(a=b){var b}`.
-func (s *Scope) MarkArguments() {
-	s.NumArguments = uint16(len(s.Undeclared))
+// MarkFuncArgs marks the declared/undeclared variables in the current scope as function arguments.
+func (s *Scope) MarkFuncArgs() {
+	s.NumFuncArgs = uint16(len(s.Declared))
+	s.NumArgUses = uint16(len(s.Undeclared)) // ensures different b's in `function f(a=b){var b}`.
 }
 
 // HoistUndeclared copies all undeclared variables of the current scope to the parent scope.
@@ -335,8 +403,7 @@ func (s *Scope) Unscope() {
 // INode is an interface for AST nodes
 type INode interface {
 	String() string
-	JS() string
-	JSON() (string, error)
+	JS(io.Writer)
 }
 
 // IStmt is a dummy interface for statements.
@@ -359,6 +426,24 @@ type IExpr interface {
 
 ////////////////////////////////////////////////////////////////
 
+// Comment block or line, usually a bang comment.
+type Comment struct {
+	Value []byte
+}
+
+func (n Comment) String() string {
+	return "Stmt(" + string(n.Value) + ")"
+}
+
+// JS writes JavaScript to writer.
+func (n Comment) JS(w io.Writer) {
+	if wi, ok := w.(parse.Indenter); ok {
+		wi.Writer.Write(n.Value)
+	} else {
+		w.Write(n.Value)
+	}
+}
+
 // BlockStmt is a block statement.
 type BlockStmt struct {
 	List []IStmt
@@ -373,45 +458,35 @@ func (n BlockStmt) String() string {
 	return s + " })"
 }
 
-// JS converts the node back to valid JavaScript
-func (n BlockStmt) JS() string {
-	s := ""
-	if n.Scope.Parent != nil {
-		s += "{ "
+// JS writes JavaScript to writer.
+func (n BlockStmt) JS(w io.Writer) {
+	if len(n.List) == 0 {
+		w.Write([]byte("{}"))
+		return
 	}
-	for _, item := range n.List {
-		s += item.JS() + "; "
-	}
-	if n.Scope.Parent != nil {
-		s += "}"
-	}
-	return s
-}
 
-// JSON converts the node back to valid JSON
-func (n BlockStmt) JSON() (string, error) {
-	if len(n.List) != 1 {
-		return "", ErrInvalidJSON
+	w.Write([]byte("{"))
+	wi := parse.NewIndenter(w, 4)
+	for _, item := range n.List {
+		wi.Write([]byte("\n"))
+		item.JS(wi)
+		if _, ok := item.(*VarDecl); ok {
+			w.Write([]byte(";"))
+		}
 	}
-	return n.List[0].JSON()
+	w.Write([]byte("\n}"))
 }
 
 // EmptyStmt is an empty statement.
-type EmptyStmt struct {
-}
+type EmptyStmt struct{}
 
 func (n EmptyStmt) String() string {
-	return "Stmt(;)"
+	return "Stmt()"
 }
 
-// JS converts the node back to valid JavaScript
-func (n EmptyStmt) JS() string {
-	return ";"
-}
-
-// JSON converts the node back to valid JSON
-func (n EmptyStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n EmptyStmt) JS(w io.Writer) {
+	w.Write([]byte(";"))
 }
 
 // ExprStmt is an expression statement.
@@ -427,14 +502,28 @@ func (n ExprStmt) String() string {
 	return "Stmt(" + n.Value.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n ExprStmt) JS() string {
-	return n.Value.JS()
-}
+// JS writes JavaScript to writer.
+func (n ExprStmt) JS(w io.Writer) {
+	buf := &bytes.Buffer{}
+	wb := io.Writer(buf)
+	if wi, ok := w.(parse.Indenter); ok {
+		// make sure that buf is indenter if w is so as well
+		// this is to prevent newlines in literals from indenting
+		wb = parse.NewIndenter(wb, wi.Indent())
+		w = wi.Writer
+	}
+	n.Value.JS(wb)
+	expr := buf.Bytes()
 
-// JSON converts the node back to valid JSON
-func (n ExprStmt) JSON() (string, error) {
-	return n.Value.JSON()
+	group := bytes.HasPrefix(expr, []byte("let "))
+	if group {
+		w.Write([]byte("("))
+	}
+	w.Write(expr)
+	if group {
+		w.Write([]byte(")"))
+	}
+	w.Write([]byte(";"))
 }
 
 // IfStmt is an if statement.
@@ -452,29 +541,28 @@ func (n IfStmt) String() string {
 	return s + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n IfStmt) JS() string {
-	s := "if (" + n.Cond.JS() + ") "
-	switch n.Body.(type) {
-	case *BlockStmt:
-		s += n.Body.JS()
-	default:
-		s += "{ " + n.Body.JS() + " }"
+// JS writes JavaScript to writer.
+func (n IfStmt) JS(w io.Writer) {
+	w.Write([]byte("if ("))
+	n.Cond.JS(w)
+	w.Write([]byte(")"))
+	if _, ok := n.Body.(*EmptyStmt); !ok {
+		w.Write([]byte(" "))
+	}
+	n.Body.JS(w)
+	if _, ok := n.Body.(*VarDecl); ok {
+		w.Write([]byte(";"))
 	}
 	if n.Else != nil {
-		switch n.Else.(type) {
-		case *BlockStmt:
-			s += " else " + n.Else.JS()
-		default:
-			s += " else { " + n.Else.JS() + " }"
+		w.Write([]byte(" else"))
+		if _, ok := n.Else.(*EmptyStmt); !ok {
+			w.Write([]byte(" "))
+		}
+		n.Else.JS(w)
+		if _, ok := n.Else.(*VarDecl); ok {
+			w.Write([]byte(";"))
 		}
 	}
-	return s
-}
-
-// JSON converts the node back to valid JSON
-func (n IfStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
 }
 
 // DoWhileStmt is a do-while iteration statement.
@@ -487,21 +575,21 @@ func (n DoWhileStmt) String() string {
 	return "Stmt(do " + n.Body.String() + " while " + n.Cond.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n DoWhileStmt) JS() string {
-	s := "do "
-	switch n.Body.(type) {
-	case *BlockStmt:
-		s += n.Body.JS()
-	default:
-		s += "{ " + n.Body.JS() + " }"
+// JS writes JavaScript to writer.
+func (n DoWhileStmt) JS(w io.Writer) {
+	w.Write([]byte("do"))
+	if _, ok := n.Body.(*EmptyStmt); !ok {
+		w.Write([]byte(" "))
 	}
-	return s + " while (" + n.Cond.JS() + ")"
-}
-
-// JSON converts the node back to valid JSON
-func (n DoWhileStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	n.Body.JS(w)
+	if _, ok := n.Body.(*VarDecl); ok {
+		w.Write([]byte("; "))
+	} else if _, ok := n.Body.(*Comment); !ok {
+		w.Write([]byte(" "))
+	}
+	w.Write([]byte("while ("))
+	n.Cond.JS(w)
+	w.Write([]byte(");"))
 }
 
 // WhileStmt is a while iteration statement.
@@ -514,18 +602,20 @@ func (n WhileStmt) String() string {
 	return "Stmt(while " + n.Cond.String() + " " + n.Body.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n WhileStmt) JS() string {
-	s := "while (" + n.Cond.JS() + ") "
-	if n.Body != nil {
-		s += n.Body.JS()
+// JS writes JavaScript to writer.
+func (n WhileStmt) JS(w io.Writer) {
+	w.Write([]byte("while ("))
+	n.Cond.JS(w)
+	w.Write([]byte(")"))
+	if _, ok := n.Body.(*EmptyStmt); ok {
+		w.Write([]byte(";"))
+		return
 	}
-	return s
-}
-
-// JSON converts the node back to valid JSON
-func (n WhileStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	w.Write([]byte(" "))
+	n.Body.JS(w)
+	if _, ok := n.Body.(*VarDecl); ok {
+		w.Write([]byte(";"))
+	}
 }
 
 // ForStmt is a regular for iteration statement.
@@ -538,7 +628,7 @@ type ForStmt struct {
 
 func (n ForStmt) String() string {
 	s := "Stmt(for"
-	if n.Init != nil {
+	if v, ok := n.Init.(*VarDecl); !ok && n.Init != nil || ok && len(v.List) != 0 {
 		s += " " + n.Init.String()
 	}
 	s += " ;"
@@ -552,28 +642,24 @@ func (n ForStmt) String() string {
 	return s + " " + n.Body.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n ForStmt) JS() string {
-	s := "for ("
-	if n.Init != nil {
-		s += n.Init.JS()
+// JS writes JavaScript to writer.
+func (n ForStmt) JS(w io.Writer) {
+	w.Write([]byte("for ("))
+	if v, ok := n.Init.(*VarDecl); !ok && n.Init != nil || ok && len(v.List) != 0 {
+		n.Init.JS(w)
 	} else {
-		s += " "
+		w.Write([]byte(" "))
 	}
-	s += "; "
+	w.Write([]byte("; "))
 	if n.Cond != nil {
-		s += n.Cond.JS()
+		n.Cond.JS(w)
 	}
-	s += "; "
+	w.Write([]byte("; "))
 	if n.Post != nil {
-		s += n.Post.JS()
+		n.Post.JS(w)
 	}
-	return s + ") " + n.Body.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n ForStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	w.Write([]byte(") "))
+	n.Body.JS(w)
 }
 
 // ForInStmt is a for-in iteration statement.
@@ -587,14 +673,14 @@ func (n ForInStmt) String() string {
 	return "Stmt(for " + n.Init.String() + " in " + n.Value.String() + " " + n.Body.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n ForInStmt) JS() string {
-	return "for (" + n.Init.JS() + " in " + n.Value.JS() + ") " + n.Body.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n ForInStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n ForInStmt) JS(w io.Writer) {
+	w.Write([]byte("for ("))
+	n.Init.JS(w)
+	w.Write([]byte(" in "))
+	n.Value.JS(w)
+	w.Write([]byte(") "))
+	n.Body.JS(w)
 }
 
 // ForOfStmt is a for-of iteration statement.
@@ -613,18 +699,18 @@ func (n ForOfStmt) String() string {
 	return s + " " + n.Init.String() + " of " + n.Value.String() + " " + n.Body.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n ForOfStmt) JS() string {
-	s := "for"
+// JS writes JavaScript to writer.
+func (n ForOfStmt) JS(w io.Writer) {
+	w.Write([]byte("for"))
 	if n.Await {
-		s += " await"
+		w.Write([]byte(" await"))
 	}
-	return s + " (" + n.Init.JS() + " of " + n.Value.JS() + ") " + n.Body.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n ForOfStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	w.Write([]byte(" ("))
+	n.Init.JS(w)
+	w.Write([]byte(" of "))
+	n.Value.JS(w)
+	w.Write([]byte(") "))
+	n.Body.JS(w)
 }
 
 // CaseClause is a case clause or default clause for a switch statement.
@@ -645,24 +731,23 @@ func (n CaseClause) String() string {
 	return s + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n CaseClause) JS() string {
-	s := " "
+// JS writes JavaScript to writer.
+func (n CaseClause) JS(w io.Writer) {
 	if n.Cond != nil {
-		s += "case " + n.Cond.JS()
+		w.Write([]byte("case "))
+		n.Cond.JS(w)
 	} else {
-		s += "default"
+		w.Write([]byte("default"))
 	}
-	s += ":"
+	w.Write([]byte(":"))
+	wi := parse.NewIndenter(w, 4)
 	for _, item := range n.List {
-		s += " " + item.JS() + ";"
+		wi.Write([]byte("\n"))
+		item.JS(wi)
+		if _, ok := item.(*VarDecl); ok {
+			w.Write([]byte(";"))
+		}
 	}
-	return s
-}
-
-// JSON converts the node back to valid JSON
-func (n CaseClause) JSON() (string, error) {
-	return "", ErrInvalidJSON
 }
 
 // SwitchStmt is a switch statement.
@@ -680,18 +765,20 @@ func (n SwitchStmt) String() string {
 	return s + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n SwitchStmt) JS() string {
-	s := "switch (" + n.Init.JS() + ") {"
-	for _, clause := range n.List {
-		s += clause.JS()
+// JS writes JavaScript to writer.
+func (n SwitchStmt) JS(w io.Writer) {
+	w.Write([]byte("switch ("))
+	n.Init.JS(w)
+	if len(n.List) == 0 {
+		w.Write([]byte(") {}"))
+		return
 	}
-	return s + " }"
-}
-
-// JSON converts the node back to valid JSON
-func (n SwitchStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	w.Write([]byte(") {"))
+	for _, clause := range n.List {
+		w.Write([]byte("\n"))
+		clause.JS(w)
+	}
+	w.Write([]byte("\n}"))
 }
 
 // BranchStmt is a continue or break statement.
@@ -708,18 +795,14 @@ func (n BranchStmt) String() string {
 	return s + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n BranchStmt) JS() string {
-	s := n.Type.String()
+// JS writes JavaScript to writer.
+func (n BranchStmt) JS(w io.Writer) {
+	w.Write(n.Type.Bytes())
 	if n.Label != nil {
-		s += " " + string(n.Label)
+		w.Write([]byte(" "))
+		w.Write(n.Label)
 	}
-	return s
-}
-
-// JSON converts the node back to valid JSON
-func (n BranchStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	w.Write([]byte(";"))
 }
 
 // ReturnStmt is a return statement.
@@ -735,18 +818,14 @@ func (n ReturnStmt) String() string {
 	return s + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n ReturnStmt) JS() string {
-	s := "return"
+// JS writes JavaScript to writer.
+func (n ReturnStmt) JS(w io.Writer) {
+	w.Write([]byte("return"))
 	if n.Value != nil {
-		s += " " + n.Value.JS()
+		w.Write([]byte(" "))
+		n.Value.JS(w)
 	}
-	return s
-}
-
-// JSON converts the node back to valid JSON
-func (n ReturnStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	w.Write([]byte(";"))
 }
 
 // WithStmt is a with statement.
@@ -759,14 +838,18 @@ func (n WithStmt) String() string {
 	return "Stmt(with " + n.Cond.String() + " " + n.Body.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n WithStmt) JS() string {
-	return "with (" + n.Cond.JS() + ") " + n.Body.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n WithStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n WithStmt) JS(w io.Writer) {
+	w.Write([]byte("with ("))
+	n.Cond.JS(w)
+	w.Write([]byte(")"))
+	if _, ok := n.Body.(*EmptyStmt); !ok {
+		w.Write([]byte(" "))
+	}
+	n.Body.JS(w)
+	if _, ok := n.Body.(*VarDecl); ok {
+		w.Write([]byte(";"))
+	}
 }
 
 // LabelledStmt is a labelled statement.
@@ -779,14 +862,17 @@ func (n LabelledStmt) String() string {
 	return "Stmt(" + string(n.Label) + " : " + n.Value.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n LabelledStmt) JS() string {
-	return string(n.Label) + ": " + n.Value.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n LabelledStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n LabelledStmt) JS(w io.Writer) {
+	w.Write(n.Label)
+	w.Write([]byte(":"))
+	if _, ok := n.Value.(*EmptyStmt); !ok {
+		w.Write([]byte(" "))
+	}
+	n.Value.JS(w)
+	if _, ok := n.Value.(*VarDecl); ok {
+		w.Write([]byte(";"))
+	}
 }
 
 // ThrowStmt is a throw statement.
@@ -798,14 +884,11 @@ func (n ThrowStmt) String() string {
 	return "Stmt(throw " + n.Value.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n ThrowStmt) JS() string {
-	return "throw " + n.Value.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n ThrowStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n ThrowStmt) JS(w io.Writer) {
+	w.Write([]byte("throw "))
+	n.Value.JS(w)
+	w.Write([]byte(";"))
 }
 
 // TryStmt is a try statement.
@@ -831,43 +914,36 @@ func (n TryStmt) String() string {
 	return s + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n TryStmt) JS() string {
-	s := "try " + n.Body.JS()
+// JS writes JavaScript to writer.
+func (n TryStmt) JS(w io.Writer) {
+	w.Write([]byte("try "))
+	n.Body.JS(w)
 	if n.Catch != nil {
-		s += " catch"
+		w.Write([]byte(" catch"))
 		if n.Binding != nil {
-			s += "(" + n.Binding.JS() + ")"
+			w.Write([]byte("("))
+			n.Binding.JS(w)
+			w.Write([]byte(")"))
 		}
-		s += " " + n.Catch.JS()
+		w.Write([]byte(" "))
+		n.Catch.JS(w)
 	}
 	if n.Finally != nil {
-		s += " finally " + n.Finally.JS()
+		w.Write([]byte(" finally "))
+		n.Finally.JS(w)
 	}
-	return s
-}
-
-// JSON converts the node back to valid JSON
-func (n TryStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
 }
 
 // DebuggerStmt is a debugger statement.
-type DebuggerStmt struct {
-}
+type DebuggerStmt struct{}
 
 func (n DebuggerStmt) String() string {
 	return "Stmt(debugger)"
 }
 
-// JS converts the node back to valid JavaScript
-func (n DebuggerStmt) JS() string {
-	return "debugger"
-}
-
-// JSON converts the node back to valid JSON
-func (n DebuggerStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n DebuggerStmt) JS(w io.Writer) {
+	w.Write([]byte("debugger;"))
 }
 
 // Alias is a name space import or import/export specifier for import/export statements.
@@ -884,14 +960,13 @@ func (alias Alias) String() string {
 	return s + string(alias.Binding)
 }
 
-// JS converts the node back to valid JavaScript
-func (alias Alias) JS() string {
-	return alias.String()
-}
-
-// JSON converts the node back to valid JSON
-func (n Alias) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (alias Alias) JS(w io.Writer) {
+	if alias.Name != nil {
+		w.Write(alias.Name)
+		w.Write([]byte(" as "))
+	}
+	w.Write(alias.Binding)
 }
 
 // ImportStmt is an import statement.
@@ -905,13 +980,13 @@ func (n ImportStmt) String() string {
 	s := "Stmt(import"
 	if n.Default != nil {
 		s += " " + string(n.Default)
-		if len(n.List) != 0 {
+		if n.List != nil {
 			s += " ,"
 		}
 	}
 	if len(n.List) == 1 && len(n.List[0].Name) == 1 && n.List[0].Name[0] == '*' {
 		s += " " + n.List[0].String()
-	} else if 0 < len(n.List) {
+	} else if n.List != nil {
 		s += " {"
 		for i, item := range n.List {
 			if i != 0 {
@@ -923,44 +998,51 @@ func (n ImportStmt) String() string {
 		}
 		s += " }"
 	}
-	if n.Default != nil || len(n.List) != 0 {
+	if n.Default != nil || n.List != nil {
 		s += " from"
 	}
 	return s + " " + string(n.Module) + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n ImportStmt) JS() string {
-	s := "import"
+// JS writes JavaScript to writer.
+func (n ImportStmt) JS(w io.Writer) {
+	if wi, ok := w.(parse.Indenter); ok {
+		w = wi.Writer
+	}
+	w.Write([]byte("import"))
 	if n.Default != nil {
-		s += " " + string(n.Default)
-		if len(n.List) != 0 {
-			s += " ,"
+		w.Write([]byte(" "))
+		w.Write(n.Default)
+		if n.List != nil {
+			w.Write([]byte(","))
 		}
 	}
 	if len(n.List) == 1 && len(n.List[0].Name) == 1 && n.List[0].Name[0] == '*' {
-		s += " " + n.List[0].JS()
-	} else if 0 < len(n.List) {
-		s += " {"
-		for i, item := range n.List {
-			if i != 0 {
-				s += " ,"
+		w.Write([]byte(" "))
+		n.List[0].JS(w)
+	} else if n.List != nil {
+		if len(n.List) == 0 {
+			w.Write([]byte(" {}"))
+		} else {
+			w.Write([]byte(" {"))
+			for j, item := range n.List {
+				if j != 0 {
+					w.Write([]byte(","))
+				}
+				if item.Binding != nil {
+					w.Write([]byte(" "))
+					item.JS(w)
+				}
 			}
-			if item.Binding != nil {
-				s += " " + item.JS()
-			}
+			w.Write([]byte(" }"))
 		}
-		s += " }"
 	}
-	if n.Default != nil || len(n.List) != 0 {
-		s += " from"
+	if n.Default != nil || n.List != nil {
+		w.Write([]byte(" from"))
 	}
-	return s + " " + string(n.Module)
-}
-
-// JSON converts the node back to valid JSON
-func (n ImportStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	w.Write([]byte(" "))
+	w.Write(n.Module)
+	w.Write([]byte(";"))
 }
 
 // ExportStmt is an export statement.
@@ -998,37 +1080,43 @@ func (n ExportStmt) String() string {
 	return s + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n ExportStmt) JS() string {
-	s := "export"
+// JS writes JavaScript to writer.
+func (n ExportStmt) JS(w io.Writer) {
+	if wi, ok := w.(parse.Indenter); ok {
+		w = wi.Writer
+	}
+	w.Write([]byte("export"))
 	if n.Decl != nil {
 		if n.Default {
-			s += " default"
+			w.Write([]byte(" default"))
 		}
-		return s + " " + n.Decl.JS()
+		w.Write([]byte(" "))
+		n.Decl.JS(w)
+		w.Write([]byte(";"))
+		return
 	} else if len(n.List) == 1 && (len(n.List[0].Name) == 1 && n.List[0].Name[0] == '*' || n.List[0].Name == nil && len(n.List[0].Binding) == 1 && n.List[0].Binding[0] == '*') {
-		s += " " + n.List[0].JS()
-	} else if 0 < len(n.List) {
-		s += " {"
-		for i, item := range n.List {
-			if i != 0 {
-				s += " ,"
+		w.Write([]byte(" "))
+		n.List[0].JS(w)
+	} else if len(n.List) == 0 {
+		w.Write([]byte(" {}"))
+	} else {
+		w.Write([]byte(" {"))
+		for j, item := range n.List {
+			if j != 0 {
+				w.Write([]byte(","))
 			}
 			if item.Binding != nil {
-				s += " " + item.JS()
+				w.Write([]byte(" "))
+				item.JS(w)
 			}
 		}
-		s += " }"
+		w.Write([]byte(" }"))
 	}
 	if n.Module != nil {
-		s += " from " + string(n.Module)
+		w.Write([]byte(" from "))
+		w.Write(n.Module)
 	}
-	return s
-}
-
-// JSON converts the node back to valid JSON
-func (n ExportStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	w.Write([]byte(";"))
 }
 
 // DirectivePrologueStmt is a string literal at the beginning of a function or module (usually "use strict").
@@ -1040,16 +1128,16 @@ func (n DirectivePrologueStmt) String() string {
 	return "Stmt(" + string(n.Value) + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n DirectivePrologueStmt) JS() string {
-	return string(n.Value)
+// JS writes JavaScript to writer.
+func (n DirectivePrologueStmt) JS(w io.Writer) {
+	if wi, ok := w.(parse.Indenter); ok {
+		w = wi.Writer
+	}
+	w.Write(n.Value)
+	w.Write([]byte(";"))
 }
 
-// JSON converts the node back to valid JSON
-func (n DirectivePrologueStmt) JSON() (string, error) {
-	return "", ErrInvalidJSON
-}
-
+func (n Comment) stmtNode()               {}
 func (n BlockStmt) stmtNode()             {}
 func (n EmptyStmt) stmtNode()             {}
 func (n ExprStmt) stmtNode()              {}
@@ -1105,14 +1193,18 @@ func (n PropertyName) String() string {
 	return string(n.Literal.Data)
 }
 
-// JS converts the node back to valid JavaScript
-func (n PropertyName) JS() string {
-	return n.String()
-}
-
-// JSON converts the node back to valid JSON
-func (n PropertyName) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n PropertyName) JS(w io.Writer) {
+	if n.Computed != nil {
+		w.Write([]byte("["))
+		n.Computed.JS(w)
+		w.Write([]byte("]"))
+		return
+	}
+	if wi, ok := w.(parse.Indenter); ok {
+		w = wi.Writer
+	}
+	w.Write(n.Literal.Data)
 }
 
 // BindingArray is an array binding pattern.
@@ -1134,31 +1226,36 @@ func (n BindingArray) String() string {
 			s += ","
 		}
 		s += " ...Binding(" + n.Rest.String() + ")"
+	} else if 0 < len(n.List) && n.List[len(n.List)-1].Binding == nil {
+		s += ","
 	}
 	return s + " ]"
 }
 
-// JS converts the node back to valid JavaScript
-func (n BindingArray) JS() string {
-	s := "["
-	for i, item := range n.List {
-		if i != 0 {
-			s += ","
+// JS writes JavaScript to writer.
+func (n BindingArray) JS(w io.Writer) {
+	w.Write([]byte("["))
+	for j, item := range n.List {
+		if j != 0 {
+			w.Write([]byte(","))
 		}
-		s += item.JS()
+		if item.Binding != nil {
+			if j != 0 {
+				w.Write([]byte(" "))
+			}
+			item.JS(w)
+		}
 	}
 	if n.Rest != nil {
 		if len(n.List) != 0 {
-			s += ","
+			w.Write([]byte(", "))
 		}
-		s += " ..." + n.Rest.JS()
+		w.Write([]byte("..."))
+		n.Rest.JS(w)
+	} else if 0 < len(n.List) && n.List[len(n.List)-1].Binding == nil {
+		w.Write([]byte(","))
 	}
-	return s + "]"
-}
-
-// JSON converts the node back to valid JSON
-func (n BindingArray) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	w.Write([]byte("]"))
 }
 
 // BindingObjectItem is a binding property.
@@ -1174,23 +1271,18 @@ func (n BindingObjectItem) String() string {
 			s += " " + n.Key.String() + ":"
 		}
 	}
-	return " " + n.Value.String()
+	return s + " " + n.Value.String()
 }
 
-// JS converts the node back to valid JavaScript
-func (n BindingObjectItem) JS() string {
-	s := ""
+// JS writes JavaScript to writer.
+func (n BindingObjectItem) JS(w io.Writer) {
 	if n.Key != nil {
 		if v, ok := n.Value.Binding.(*Var); !ok || !n.Key.IsIdent(v.Data) {
-			s += " " + n.Key.JS() + ":"
+			n.Key.JS(w)
+			w.Write([]byte(": "))
 		}
 	}
-	return " " + n.Value.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n BindingObjectItem) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	n.Value.JS(w)
 }
 
 // BindingObject is an object binding pattern.
@@ -1205,12 +1297,7 @@ func (n BindingObject) String() string {
 		if i != 0 {
 			s += ","
 		}
-		if item.Key != nil {
-			if v, ok := item.Value.Binding.(*Var); !ok || !item.Key.IsIdent(v.Data) {
-				s += " " + item.Key.String() + ":"
-			}
-		}
-		s += " " + item.Value.String()
+		s += item.String()
 	}
 	if n.Rest != nil {
 		if len(n.List) != 0 {
@@ -1221,32 +1308,23 @@ func (n BindingObject) String() string {
 	return s + " }"
 }
 
-// JS converts the node back to valid JavaScript
-func (n BindingObject) JS() string {
-	s := "{"
-	for i, item := range n.List {
-		if i != 0 {
-			s += ","
+// JS writes JavaScript to writer.
+func (n BindingObject) JS(w io.Writer) {
+	w.Write([]byte("{"))
+	for j, item := range n.List {
+		if j != 0 {
+			w.Write([]byte(", "))
 		}
-		if item.Key != nil {
-			if v, ok := item.Value.Binding.(*Var); !ok || !item.Key.IsIdent(v.Data) {
-				s += " " + item.Key.JS() + ":"
-			}
-		}
-		s += " " + item.Value.JS()
+		item.JS(w)
 	}
 	if n.Rest != nil {
 		if len(n.List) != 0 {
-			s += ","
+			w.Write([]byte(", "))
 		}
-		s += " ..." + string(n.Rest.Data)
+		w.Write([]byte("..."))
+		w.Write(n.Rest.Data)
 	}
-	return s + " }"
-}
-
-// JSON converts the node back to valid JSON
-func (n BindingObject) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	w.Write([]byte("}"))
 }
 
 // BindingElement is a binding element.
@@ -1266,21 +1344,17 @@ func (n BindingElement) String() string {
 	return s + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n BindingElement) JS() string {
+// JS writes JavaScript to writer.
+func (n BindingElement) JS(w io.Writer) {
 	if n.Binding == nil {
-		return ""
+		return
 	}
-	s := n.Binding.JS()
-	if n.Default != nil {
-		s += " = " + n.Default.JS()
-	}
-	return s
-}
 
-// JSON converts the node back to valid JSON
-func (n BindingElement) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	n.Binding.JS(w)
+	if n.Default != nil {
+		w.Write([]byte(" = "))
+		n.Default.JS(w)
+	}
 }
 
 func (v *Var) bindingNode()          {}
@@ -1292,7 +1366,9 @@ func (n BindingObject) bindingNode() {}
 // VarDecl is a variable statement or lexical declaration.
 type VarDecl struct {
 	TokenType
-	List []BindingElement
+	List             []BindingElement
+	Scope            *Scope
+	InFor, InForInOf bool
 }
 
 func (n VarDecl) String() string {
@@ -1303,21 +1379,16 @@ func (n VarDecl) String() string {
 	return s + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n VarDecl) JS() string {
-	s := n.TokenType.String()
-	for i, item := range n.List {
-		if i != 0 {
-			s += ","
+// JS writes JavaScript to writer.
+func (n VarDecl) JS(w io.Writer) {
+	w.Write(n.TokenType.Bytes())
+	for j, item := range n.List {
+		if j != 0 {
+			w.Write([]byte(","))
 		}
-		s += " " + item.JS()
+		w.Write([]byte(" "))
+		item.JS(w)
 	}
-	return s
-}
-
-// JSON converts the node back to valid JSON
-func (n VarDecl) JSON() (string, error) {
-	return "", ErrInvalidJSON
 }
 
 // Params is a list of parameters for functions, methods, and arrow function.
@@ -1343,27 +1414,23 @@ func (n Params) String() string {
 	return s + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n Params) JS() string {
-	s := "("
-	for i, item := range n.List {
-		if i != 0 {
-			s += ", "
+// JS writes JavaScript to writer.
+func (n Params) JS(w io.Writer) {
+	w.Write([]byte("("))
+	for j, item := range n.List {
+		if j != 0 {
+			w.Write([]byte(", "))
 		}
-		s += item.JS()
+		item.JS(w)
 	}
 	if n.Rest != nil {
 		if len(n.List) != 0 {
-			s += ", "
+			w.Write([]byte(", "))
 		}
-		s += "..." + n.Rest.JS()
+		w.Write([]byte("..."))
+		n.Rest.JS(w)
 	}
-	return s + ")"
-}
-
-// JSON converts the node back to valid JSON
-func (n Params) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	w.Write([]byte(")"))
 }
 
 // FuncDecl is an (async) (generator) function declaration or expression.
@@ -1391,26 +1458,24 @@ func (n FuncDecl) String() string {
 	return s + " " + n.Params.String() + " " + n.Body.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n FuncDecl) JS() string {
-	s := ""
+// JS writes JavaScript to writer.
+func (n FuncDecl) JS(w io.Writer) {
 	if n.Async {
-		s += "async function"
+		w.Write([]byte("async function"))
 	} else {
-		s += "function"
+		w.Write([]byte("function"))
 	}
+
 	if n.Generator {
-		s += "*"
+		w.Write([]byte("*"))
 	}
 	if n.Name != nil {
-		s += " " + string(n.Name.Data)
+		w.Write([]byte(" "))
+		w.Write(n.Name.Data)
 	}
-	return s + " " + n.Params.JS() + " " + n.Body.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n FuncDecl) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	n.Params.JS(w)
+	w.Write([]byte(" "))
+	n.Body.JS(w)
 }
 
 // MethodDecl is a method definition in a class declaration.
@@ -1446,67 +1511,117 @@ func (n MethodDecl) String() string {
 	return "Method(" + s[1:] + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n MethodDecl) JS() string {
-	s := ""
+// JS writes JavaScript to writer.
+func (n MethodDecl) JS(w io.Writer) {
+	writen := false
 	if n.Static {
-		s += " static"
+		w.Write([]byte("static"))
+		writen = true
 	}
 	if n.Async {
-		s += " async"
+		if writen {
+			w.Write([]byte(" "))
+		}
+		w.Write([]byte("async"))
+		writen = true
 	}
 	if n.Generator {
-		s += " *"
+		if writen {
+			w.Write([]byte(" "))
+		}
+		w.Write([]byte("*"))
+		writen = true
 	}
 	if n.Get {
-		s += " get"
+		if writen {
+			w.Write([]byte(" "))
+		}
+		w.Write([]byte("get"))
+		writen = true
 	}
 	if n.Set {
-		s += " set"
+		if writen {
+			w.Write([]byte(" "))
+		}
+		w.Write([]byte("set"))
+		writen = true
 	}
-	s += " " + n.Name.JS() + " " + n.Params.JS() + " " + n.Body.JS()
-	return s[1:]
+	if writen {
+		w.Write([]byte(" "))
+	}
+	n.Name.JS(w)
+	w.Write([]byte(" "))
+	n.Params.JS(w)
+	w.Write([]byte(" "))
+	n.Body.JS(w)
 }
 
-// JSON converts the node back to valid JSON
-func (n MethodDecl) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// Field is a field definition in a class declaration.
+type Field struct {
+	Static bool
+	Name   PropertyName
+	Init   IExpr
 }
 
-// FieldDefinition is a field definition in a class declaration.
-type FieldDefinition struct {
-	Name PropertyName
-	Init IExpr
-}
-
-func (n FieldDefinition) String() string {
-	s := "Definition(" + n.Name.String()
+func (n Field) String() string {
+	s := "Field("
+	if n.Static {
+		s += "static "
+	}
+	s += n.Name.String()
 	if n.Init != nil {
 		s += " = " + n.Init.String()
 	}
 	return s + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n FieldDefinition) JS() string {
-	s := n.Name.String()
-	if n.Init != nil {
-		s += " = " + n.Init.JS()
+// JS writes JavaScript to writer.
+func (n Field) JS(w io.Writer) {
+	if n.Static {
+		w.Write([]byte("static "))
 	}
-	return s
+	n.Name.JS(w)
+	if n.Init != nil {
+		w.Write([]byte(" = "))
+		n.Init.JS(w)
+	}
 }
 
-// JSON converts the node back to valid JSON
-func (n FieldDefinition) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// ClassElement is a class element that is either a static block, a field definition, or a class method
+type ClassElement struct {
+	StaticBlock *BlockStmt  // can be nil
+	Method      *MethodDecl // can be nil
+	Field
+}
+
+func (n ClassElement) String() string {
+	if n.StaticBlock != nil {
+		return "Static(" + n.StaticBlock.String() + ")"
+	} else if n.Method != nil {
+		return n.Method.String()
+	}
+	return n.Field.String()
+}
+
+// JS writes JavaScript to writer.
+func (n ClassElement) JS(w io.Writer) {
+	if n.StaticBlock != nil {
+		w.Write([]byte("static "))
+		n.StaticBlock.JS(w)
+		return
+	} else if n.Method != nil {
+		n.Method.JS(w)
+		return
+	}
+	n.Field.JS(w)
+	w.Write([]byte(";"))
 }
 
 // ClassDecl is a class declaration.
 type ClassDecl struct {
-	Name        *Var  // can be nil
-	Extends     IExpr // can be nil
-	Definitions []FieldDefinition
-	Methods     []*MethodDecl
+	Name    *Var  // can be nil
+	Extends IExpr // can be nil
+	List    []ClassElement
 }
 
 func (n ClassDecl) String() string {
@@ -1517,37 +1632,34 @@ func (n ClassDecl) String() string {
 	if n.Extends != nil {
 		s += " extends " + n.Extends.String()
 	}
-	for _, item := range n.Definitions {
-		s += " " + item.String()
-	}
-	for _, item := range n.Methods {
+	for _, item := range n.List {
 		s += " " + item.String()
 	}
 	return s + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n ClassDecl) JS() string {
-	s := "class"
+// JS writes JavaScript to writer.
+func (n ClassDecl) JS(w io.Writer) {
+	w.Write([]byte("class"))
 	if n.Name != nil {
-		s += " " + string(n.Name.Data)
+		w.Write([]byte(" "))
+		w.Write(n.Name.Data)
 	}
 	if n.Extends != nil {
-		s += " extends " + n.Extends.JS()
+		w.Write([]byte(" extends "))
+		n.Extends.JS(w)
 	}
-	s += " { "
-	for _, item := range n.Definitions {
-		s += item.JS() + "; "
+	if len(n.List) == 0 {
+		w.Write([]byte(" {}"))
+		return
 	}
-	for _, item := range n.Methods {
-		s += item.JS() + "; "
+	w.Write([]byte(" {"))
+	wi := parse.NewIndenter(w, 4)
+	for _, item := range n.List {
+		wi.Write([]byte("\n"))
+		item.JS(wi)
 	}
-	return s + "}"
-}
-
-// JSON converts the node back to valid JSON
-func (n ClassDecl) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	w.Write([]byte("\n}"))
 }
 
 func (n VarDecl) stmtNode()   {}
@@ -1571,23 +1683,37 @@ func (n LiteralExpr) String() string {
 	return string(n.Data)
 }
 
-// JS converts the node back to valid JavaScript
-func (n LiteralExpr) JS() string {
-	return string(n.Data)
+// JS writes JavaScript to writer.
+func (n LiteralExpr) JS(w io.Writer) {
+	if wi, ok := w.(parse.Indenter); ok {
+		w = wi.Writer
+	}
+	w.Write(n.Data)
 }
 
-// JSON converts the node back to valid JSON
-func (n LiteralExpr) JSON() (string, error) {
-	if n.TokenType == TrueToken || n.TokenType == FalseToken || n.TokenType == NullToken || n.TokenType == DecimalToken {
-		return string(n.Data), nil
-	} else if n.TokenType == StringToken {
-		if n.Data[0] == '\'' {
-			n.Data[0] = '"'
-			n.Data[len(n.Data)-1] = '"'
-		}
-		return string(n.Data), nil
+// JSON writes JSON to writer.
+func (n LiteralExpr) JSON(w io.Writer) error {
+	if wi, ok := w.(parse.Indenter); ok {
+		w = wi.Writer
 	}
-	return "", ErrInvalidJSON
+	if n.TokenType == TrueToken || n.TokenType == FalseToken || n.TokenType == NullToken || n.TokenType == DecimalToken || n.TokenType == IntegerToken {
+		w.Write(n.Data)
+		return nil
+	} else if n.TokenType == StringToken {
+		data := n.Data
+		if n.Data[0] == '\'' {
+			data = parse.Copy(data)
+			data = bytes.ReplaceAll(data, []byte(`\'`), []byte(`'`))
+			data = bytes.ReplaceAll(data, []byte(`"`), []byte(`\"`))
+			data[0] = '"'
+			data[len(data)-1] = '"'
+		}
+		w.Write(data)
+		return nil
+	}
+	js := &strings.Builder{}
+	n.JS(js)
+	return fmt.Errorf("%v: literal expression is not valid JSON: %v", ErrInvalidJSON, js.String())
 }
 
 // Element is an array literal element.
@@ -1607,21 +1733,14 @@ func (n Element) String() string {
 	return s
 }
 
-// JS converts the node back to valid JavaScript
-func (n Element) JS() string {
-	s := ""
+// JS writes JavaScript to writer.
+func (n Element) JS(w io.Writer) {
 	if n.Value != nil {
 		if n.Spread {
-			s += "..."
+			w.Write([]byte("..."))
 		}
-		s += n.Value.JS()
+		n.Value.JS(w)
 	}
-	return s
-}
-
-// JSON converts the node back to valid JSON
-func (n Element) JSON() (string, error) {
-	return "", ErrInvalidJSON
 }
 
 // ArrayExpr is an array literal.
@@ -1648,48 +1767,48 @@ func (n ArrayExpr) String() string {
 	return s + "]"
 }
 
-// JS converts the node back to valid JavaScript
-func (n ArrayExpr) JS() string {
-	s := "["
-	for i, item := range n.List {
-		if i != 0 {
-			s += ", "
+// JS writes JavaScript to writer.
+func (n ArrayExpr) JS(w io.Writer) {
+	w.Write([]byte("["))
+	for j, item := range n.List {
+		if j != 0 {
+			w.Write([]byte(", "))
 		}
 		if item.Value != nil {
 			if item.Spread {
-				s += "..."
+				w.Write([]byte("..."))
 			}
-			s += item.Value.JS()
+			item.Value.JS(w)
 		}
 	}
 	if 0 < len(n.List) && n.List[len(n.List)-1].Value == nil {
-		s += ","
+		w.Write([]byte(","))
 	}
-	return s + "]"
+	w.Write([]byte("]"))
 }
 
-// JSON converts the node back to valid JSON
-func (n ArrayExpr) JSON() (string, error) {
-	s := "["
+// JSON writes JSON to writer.
+func (n ArrayExpr) JSON(w io.Writer) error {
+	w.Write([]byte("["))
 	for i, item := range n.List {
 		if i != 0 {
-			s += ", "
+			w.Write([]byte(", "))
 		}
-		if item.Value != nil {
-			if item.Spread {
-				return "", ErrInvalidJSON
-			}
-			ss, err := item.Value.JSON()
-			if err != nil {
-				return "", err
-			}
-			s += ss
+		if item.Value == nil || item.Spread {
+			js := &strings.Builder{}
+			n.JS(js)
+			return fmt.Errorf("%v: array literal is not valid JSON: %v", ErrInvalidJSON, js.String())
+		}
+		if val, ok := item.Value.(JSONer); !ok {
+			js := &strings.Builder{}
+			item.Value.JS(js)
+			return fmt.Errorf("%v: value is not valid JSON: %v", ErrInvalidJSON, js.String())
+		} else if err := val.JSON(w); err != nil {
+			return err
 		}
 	}
-	if 0 < len(n.List) && n.List[len(n.List)-1].Value == nil {
-		return "", ErrInvalidJSON
-	}
-	return s + "]", nil
+	w.Write([]byte("]"))
+	return nil
 }
 
 // Property is a property definition in an object literal.
@@ -1718,44 +1837,50 @@ func (n Property) String() string {
 	return s
 }
 
-// JS converts the node back to valid JavaScript
-func (n Property) JS() string {
-	s := ""
+// JS writes JavaScript to writer.
+func (n Property) JS(w io.Writer) {
 	if n.Name != nil {
 		if v, ok := n.Value.(*Var); !ok || !n.Name.IsIdent(v.Data) {
-			s += n.Name.JS() + ": "
+			n.Name.JS(w)
+			w.Write([]byte(": "))
 		}
 	} else if n.Spread {
-		s += "..."
+		w.Write([]byte("..."))
 	}
-	s += n.Value.JS()
+	n.Value.JS(w)
 	if n.Init != nil {
-		s += " = " + n.Init.JS()
+		w.Write([]byte(" = "))
+		n.Init.JS(w)
 	}
-	return s
 }
 
-// JSON converts the node back to valid JSON
-func (n Property) JSON() (string, error) {
-	s := ""
-	if n.Name == nil || n.Name.Literal.TokenType != StringToken && n.Name.Literal.TokenType != IdentifierToken || n.Spread || n.Init != nil {
-		return "", ErrInvalidJSON
-	} else if n.Name.Literal.TokenType == IdentifierToken {
-		n.Name.Literal.TokenType = StringToken
-		n.Name.Literal.Data = append(append([]byte{'"'}, n.Name.Literal.Data...), '"')
+// JSON writes JSON to writer.
+func (n Property) JSON(w io.Writer) error {
+	if n.Name == nil || n.Spread || n.Init != nil {
+		js := &strings.Builder{}
+		n.JS(js)
+		return fmt.Errorf("%v: property is not valid JSON: %v", ErrInvalidJSON, js.String())
+	} else if n.Name.Literal.TokenType == StringToken {
+		_ = n.Name.Literal.JSON(w)
+	} else if n.Name.Literal.TokenType == IdentifierToken || n.Name.Literal.TokenType == IntegerToken || n.Name.Literal.TokenType == DecimalToken {
+		w.Write([]byte(`"`))
+		w.Write(n.Name.Literal.Data)
+		w.Write([]byte(`"`))
+	} else {
+		js := &strings.Builder{}
+		n.JS(js)
+		return fmt.Errorf("%v: property is not valid JSON: %v", ErrInvalidJSON, js.String())
 	}
+	w.Write([]byte(": "))
 
-	ss, _ := n.Name.Literal.JSON()
-	s += ss + ": "
-
-	var err error
-	ss, err = n.Value.JSON()
-	if err != nil {
-		fmt.Println("b")
-		return "", err
+	if val, ok := n.Value.(JSONer); !ok {
+		js := &strings.Builder{}
+		n.Value.JS(js)
+		return fmt.Errorf("%v: value is not valid JSON: %v", ErrInvalidJSON, js.String())
+	} else if err := val.JSON(w); err != nil {
+		return err
 	}
-	s += ss
-	return s, nil
+	return nil
 }
 
 // ObjectExpr is an object literal.
@@ -1774,32 +1899,31 @@ func (n ObjectExpr) String() string {
 	return s + "}"
 }
 
-// JS converts the node back to valid JavaScript
-func (n ObjectExpr) JS() string {
-	s := "{"
-	for i, item := range n.List {
-		if i != 0 {
-			s += ", "
+// JS writes JavaScript to writer.
+func (n ObjectExpr) JS(w io.Writer) {
+	w.Write([]byte("{"))
+	for j, item := range n.List {
+		if j != 0 {
+			w.Write([]byte(", "))
 		}
-		s += item.JS()
+		item.JS(w)
 	}
-	return s + "}"
+	w.Write([]byte("}"))
 }
 
-// JSON converts the node back to valid JSON
-func (n ObjectExpr) JSON() (string, error) {
-	s := "{"
+// JSON writes JSON to writer.
+func (n ObjectExpr) JSON(w io.Writer) error {
+	w.Write([]byte("{"))
 	for i, item := range n.List {
 		if i != 0 {
-			s += ", "
+			w.Write([]byte(", "))
 		}
-		ss, err := item.JSON()
-		if err != nil {
-			return "", err
+		if err := item.JSON(w); err != nil {
+			return err
 		}
-		s += ss
 	}
-	return s + "}", nil
+	w.Write([]byte("}"))
+	return nil
 }
 
 // TemplatePart is a template head or middle.
@@ -1812,28 +1936,28 @@ func (n TemplatePart) String() string {
 	return string(n.Value) + n.Expr.String()
 }
 
-// JS converts the node back to valid JavaScript
-func (n TemplatePart) JS() string {
-	return string(n.Value) + n.Expr.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n TemplatePart) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n TemplatePart) JS(w io.Writer) {
+	w.Write(n.Value)
+	n.Expr.JS(w)
 }
 
 // TemplateExpr is a template literal or member/call expression, super property, or optional chain with template literal.
 type TemplateExpr struct {
-	Tag  IExpr // can be nil
-	List []TemplatePart
-	Tail []byte
-	Prec OpPrec
+	Tag      IExpr // can be nil
+	List     []TemplatePart
+	Tail     []byte
+	Prec     OpPrec
+	Optional bool
 }
 
 func (n TemplateExpr) String() string {
 	s := ""
 	if n.Tag != nil {
 		s += n.Tag.String()
+		if n.Optional {
+			s += "?."
+		}
 	}
 	for _, item := range n.List {
 		s += item.String()
@@ -1841,21 +1965,45 @@ func (n TemplateExpr) String() string {
 	return s + string(n.Tail)
 }
 
-// JS converts the node back to valid JavaScript
-func (n TemplateExpr) JS() string {
-	s := ""
+// JS writes JavaScript to writer.
+func (n TemplateExpr) JS(w io.Writer) {
+	if wi, ok := w.(parse.Indenter); ok {
+		w = wi.Writer
+	}
 	if n.Tag != nil {
-		s += n.Tag.JS()
+		n.Tag.JS(w)
+		if n.Optional {
+			w.Write([]byte("?."))
+		}
 	}
 	for _, item := range n.List {
-		s += item.JS()
+		item.JS(w)
 	}
-	return s + string(n.Tail)
+	w.Write(n.Tail)
 }
 
-// JSON converts the node back to valid JSON
-func (n TemplateExpr) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JSON writes JSON to writer.
+func (n TemplateExpr) JSON(w io.Writer) error {
+	if wi, ok := w.(parse.Indenter); ok {
+		w = wi.Writer
+	}
+	if n.Tag != nil || len(n.List) != 0 {
+		js := &strings.Builder{}
+		n.JS(js)
+		return fmt.Errorf("%v: value is not valid JSON: %v", ErrInvalidJSON, js.String())
+	}
+
+	// allow template literal string to be converted to normal string (to allow for minified JS)
+	data := parse.Copy(n.Tail)
+	data = bytes.ReplaceAll(data, []byte("\n"), []byte("\\n"))
+	data = bytes.ReplaceAll(data, []byte("\r"), []byte("\\r"))
+	data = bytes.ReplaceAll(data, []byte("\\`"), []byte("`"))
+	data = bytes.ReplaceAll(data, []byte("\\$"), []byte("$"))
+	data = bytes.ReplaceAll(data, []byte(`"`), []byte(`\"`))
+	data[0] = '"'
+	data[len(data)-1] = '"'
+	w.Write(data)
+	return nil
 }
 
 // GroupExpr is a parenthesized expression.
@@ -1867,92 +2015,96 @@ func (n GroupExpr) String() string {
 	return "(" + n.X.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n GroupExpr) JS() string {
-	return "(" + n.X.JS() + ")"
-}
-
-// JSON converts the node back to valid JSON
-func (n GroupExpr) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n GroupExpr) JS(w io.Writer) {
+	w.Write([]byte("("))
+	n.X.JS(w)
+	w.Write([]byte(")"))
 }
 
 // IndexExpr is a member/call expression, super property, or optional chain with an index expression.
 type IndexExpr struct {
-	X    IExpr
-	Y    IExpr
-	Prec OpPrec
+	X        IExpr
+	Y        IExpr
+	Prec     OpPrec
+	Optional bool
 }
 
 func (n IndexExpr) String() string {
+	if n.Optional {
+		return "(" + n.X.String() + "?.[" + n.Y.String() + "])"
+	}
 	return "(" + n.X.String() + "[" + n.Y.String() + "])"
 }
 
-// JS converts the node back to valid JavaScript
-func (n IndexExpr) JS() string {
-	return n.X.JS() + "[" + n.Y.JS() + "]"
-}
-
-// JSON converts the node back to valid JSON
-func (n IndexExpr) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n IndexExpr) JS(w io.Writer) {
+	n.X.JS(w)
+	if n.Optional {
+		w.Write([]byte("?.["))
+	} else {
+		w.Write([]byte("["))
+	}
+	n.Y.JS(w)
+	w.Write([]byte("]"))
 }
 
 // DotExpr is a member/call expression, super property, or optional chain with a dot expression.
 type DotExpr struct {
-	X    IExpr
-	Y    LiteralExpr
-	Prec OpPrec
+	X        IExpr
+	Y        LiteralExpr
+	Prec     OpPrec
+	Optional bool
 }
 
 func (n DotExpr) String() string {
+	if n.Optional {
+		return "(" + n.X.String() + "?." + n.Y.String() + ")"
+	}
 	return "(" + n.X.String() + "." + n.Y.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n DotExpr) JS() string {
-	return n.X.JS() + "." + n.Y.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n DotExpr) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n DotExpr) JS(w io.Writer) {
+	lit, ok := n.X.(*LiteralExpr)
+	group := ok && !n.Optional && (lit.TokenType == DecimalToken || lit.TokenType == IntegerToken)
+	if group {
+		w.Write([]byte("("))
+	}
+	n.X.JS(w)
+	if n.Optional {
+		w.Write([]byte("?."))
+	} else {
+		if group {
+			w.Write([]byte(")"))
+		}
+		w.Write([]byte("."))
+	}
+	n.Y.JS(w)
 }
 
 // NewTargetExpr is a new target meta property.
-type NewTargetExpr struct {
-}
+type NewTargetExpr struct{}
 
 func (n NewTargetExpr) String() string {
 	return "(new.target)"
 }
 
-// JS converts the node back to valid JavaScript
-func (n NewTargetExpr) JS() string {
-	return "new.target"
-}
-
-// JSON converts the node back to valid JSON
-func (n NewTargetExpr) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n NewTargetExpr) JS(w io.Writer) {
+	w.Write([]byte("new.target"))
 }
 
 // ImportMetaExpr is a import meta meta property.
-type ImportMetaExpr struct {
-}
+type ImportMetaExpr struct{}
 
 func (n ImportMetaExpr) String() string {
 	return "(import.meta)"
 }
 
-// JS converts the node back to valid JavaScript
-func (n ImportMetaExpr) JS() string {
-	return "import.meta"
-}
-
-// JSON converts the node back to valid JSON
-func (n ImportMetaExpr) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n ImportMetaExpr) JS(w io.Writer) {
+	w.Write([]byte("import.meta"))
 }
 
 type Arg struct {
@@ -1968,18 +2120,12 @@ func (n Arg) String() string {
 	return s + n.Value.String()
 }
 
-// JS converts the node back to valid JavaScript
-func (n Arg) JS() string {
-	s := ""
+// JS writes JavaScript to writer.
+func (n Arg) JS(w io.Writer) {
 	if n.Rest {
-		s += "..."
+		w.Write([]byte("..."))
 	}
-	return s + n.Value.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n Arg) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	n.Value.JS(w)
 }
 
 // Args is a list of arguments as used by new and call expressions.
@@ -1998,21 +2144,14 @@ func (n Args) String() string {
 	return s + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n Args) JS() string {
-	s := ""
-	for i, item := range n.List {
-		if i != 0 {
-			s += ", "
+// JS writes JavaScript to writer.
+func (n Args) JS(w io.Writer) {
+	for j, item := range n.List {
+		if j != 0 {
+			w.Write([]byte(", "))
 		}
-		s += item.JS()
+		item.JS(w)
 	}
-	return s
-}
-
-// JSON converts the node back to valid JSON
-func (n Args) JSON() (string, error) {
-	return "", ErrInvalidJSON
 }
 
 // NewExpr is a new expression or new member expression.
@@ -2028,75 +2167,43 @@ func (n NewExpr) String() string {
 	return "(new " + n.X.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n NewExpr) JS() string {
+// JS writes JavaScript to writer.
+func (n NewExpr) JS(w io.Writer) {
+	w.Write([]byte("new "))
+	n.X.JS(w)
 	if n.Args != nil {
-		return "new " + n.X.JS() + "(" + n.Args.JS() + ")"
+		w.Write([]byte("("))
+		n.Args.JS(w)
+		w.Write([]byte(")"))
+	} else {
+		w.Write([]byte("()"))
 	}
-
-	// always use parentheses to prevent errors when chaining e.g. new Date().getTime()
-	return "new " + n.X.JS() + "()"
-}
-
-// JSON converts the node back to valid JSON
-func (n NewExpr) JSON() (string, error) {
-	return "", ErrInvalidJSON
 }
 
 // CallExpr is a call expression.
 type CallExpr struct {
-	X    IExpr
-	Args Args
+	X        IExpr
+	Args     Args
+	Optional bool
 }
 
 func (n CallExpr) String() string {
+	if n.Optional {
+		return "(" + n.X.String() + "?." + n.Args.String() + ")"
+	}
 	return "(" + n.X.String() + n.Args.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n CallExpr) JS() string {
-	return n.X.JS() + "(" + n.Args.JS() + ")"
-}
-
-// JSON converts the node back to valid JSON
-func (n CallExpr) JSON() (string, error) {
-	return "", ErrInvalidJSON
-}
-
-// OptChainExpr is an optional chain.
-type OptChainExpr struct {
-	X IExpr
-	Y IExpr // can be CallExpr, IndexExpr, LiteralExpr, or TemplateExpr
-}
-
-func (n OptChainExpr) String() string {
-	s := "(" + n.X.String() + "?."
-	switch y := n.Y.(type) {
-	case *CallExpr:
-		return s + y.Args.String() + ")"
-	case *IndexExpr:
-		return s + "[" + y.Y.String() + "])"
-	default:
-		return s + y.String() + ")"
+// JS writes JavaScript to writer.
+func (n CallExpr) JS(w io.Writer) {
+	n.X.JS(w)
+	if n.Optional {
+		w.Write([]byte("?.("))
+	} else {
+		w.Write([]byte("("))
 	}
-}
-
-// JS converts the node back to valid JavaScript
-func (n OptChainExpr) JS() string {
-	s := n.X.String() + "?."
-	switch y := n.Y.(type) {
-	case *CallExpr:
-		return s + y.Args.JS() + ")"
-	case *IndexExpr:
-		return s + "[" + y.Y.JS() + "])"
-	default:
-		return s + y.JS()
-	}
-}
-
-// JSON converts the node back to valid JSON
-func (n OptChainExpr) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	n.Args.JS(w)
+	w.Write([]byte(")"))
 }
 
 // UnaryExpr is an update or unary expression.
@@ -2114,19 +2221,39 @@ func (n UnaryExpr) String() string {
 	return "(" + n.Op.String() + n.X.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n UnaryExpr) JS() string {
+// JS writes JavaScript to writer.
+func (n UnaryExpr) JS(w io.Writer) {
 	if n.Op == PostIncrToken || n.Op == PostDecrToken {
-		return n.X.JS() + n.Op.String()
-	} else if IsIdentifierName(n.Op) {
-		return n.Op.String() + " " + n.X.JS()
+		n.X.JS(w)
+		w.Write(n.Op.Bytes())
+		return
+	} else if unary, ok := n.X.(*UnaryExpr); ok && (n.Op == PosToken && (unary.Op == PreIncrToken || unary.Op == PosToken) || n.Op == NegToken && (unary.Op == PreDecrToken || unary.Op == NegToken)) || IsIdentifierName(n.Op) {
+		w.Write(n.Op.Bytes())
+		w.Write([]byte(" "))
+		n.X.JS(w)
+		return
 	}
-	return n.Op.String() + n.X.JS()
+	w.Write(n.Op.Bytes())
+	n.X.JS(w)
 }
 
-// JSON converts the node back to valid JSON
-func (n UnaryExpr) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JSON writes JSON to writer.
+func (n UnaryExpr) JSON(w io.Writer) error {
+	if lit, ok := n.X.(*LiteralExpr); ok && n.Op == NegToken && (lit.TokenType == DecimalToken || lit.TokenType == IntegerToken) {
+		w.Write([]byte("-"))
+		w.Write(lit.Data)
+		return nil
+	} else if n.Op == NotToken && lit.TokenType == IntegerToken && (lit.Data[0] == '0' || lit.Data[0] == '1') {
+		if lit.Data[0] == '0' {
+			w.Write([]byte("true"))
+		} else {
+			w.Write([]byte("false"))
+		}
+		return nil
+	}
+	js := &strings.Builder{}
+	n.JS(js)
+	return fmt.Errorf("%v: unary expression is not valid JSON: %v", ErrInvalidJSON, js.String())
 }
 
 // BinaryExpr is a binary expression.
@@ -2142,14 +2269,13 @@ func (n BinaryExpr) String() string {
 	return "(" + n.X.String() + n.Op.String() + n.Y.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n BinaryExpr) JS() string {
-	return n.X.JS() + " " + n.Op.String() + " " + n.Y.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n BinaryExpr) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n BinaryExpr) JS(w io.Writer) {
+	n.X.JS(w)
+	w.Write([]byte(" "))
+	w.Write(n.Op.Bytes())
+	w.Write([]byte(" "))
+	n.Y.JS(w)
 }
 
 // CondExpr is a conditional expression.
@@ -2161,14 +2287,13 @@ func (n CondExpr) String() string {
 	return "(" + n.Cond.String() + " ? " + n.X.String() + " : " + n.Y.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n CondExpr) JS() string {
-	return n.Cond.JS() + " ? " + n.X.JS() + " : " + n.Y.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n CondExpr) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// JS writes JavaScript to writer.
+func (n CondExpr) JS(w io.Writer) {
+	n.Cond.JS(w)
+	w.Write([]byte(" ? "))
+	n.X.JS(w)
+	w.Write([]byte(" : "))
+	n.Y.JS(w)
 }
 
 // YieldExpr is a yield expression.
@@ -2188,21 +2313,17 @@ func (n YieldExpr) String() string {
 	return s + " " + n.X.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n YieldExpr) JS() string {
+// JS writes JavaScript to writer.
+func (n YieldExpr) JS(w io.Writer) {
+	w.Write([]byte("yield"))
 	if n.X == nil {
-		return "yield"
+		return
 	}
-	s := "yield"
 	if n.Generator {
-		s += "*"
+		w.Write([]byte("*"))
 	}
-	return s + " " + n.X.JS()
-}
-
-// JSON converts the node back to valid JSON
-func (n YieldExpr) JSON() (string, error) {
-	return "", ErrInvalidJSON
+	w.Write([]byte(" "))
+	n.X.JS(w)
 }
 
 // ArrowFunc is an (async) arrow function.
@@ -2220,18 +2341,40 @@ func (n ArrowFunc) String() string {
 	return s + n.Params.String() + " => " + n.Body.String() + ")"
 }
 
-// JS converts the node back to valid JavaScript
-func (n ArrowFunc) JS() string {
-	s := ""
+// JS writes JavaScript to writer.
+func (n ArrowFunc) JS(w io.Writer) {
 	if n.Async {
-		s += "async "
+		w.Write([]byte("async "))
 	}
-	return s + n.Params.JS() + " => " + n.Body.JS()
+	n.Params.JS(w)
+	w.Write([]byte(" => "))
+	n.Body.JS(w)
 }
 
-// JSON converts the node back to valid JSON
-func (n ArrowFunc) JSON() (string, error) {
-	return "", ErrInvalidJSON
+// CommaExpr is a series of comma expressions.
+type CommaExpr struct {
+	List []IExpr
+}
+
+func (n CommaExpr) String() string {
+	s := "("
+	for i, item := range n.List {
+		if i != 0 {
+			s += ","
+		}
+		s += item.String()
+	}
+	return s + ")"
+}
+
+// JS writes JavaScript to writer.
+func (n CommaExpr) JS(w io.Writer) {
+	for j, item := range n.List {
+		if j != 0 {
+			w.Write([]byte(","))
+		}
+		item.JS(w)
+	}
 }
 
 func (v *Var) exprNode()           {}
@@ -2246,9 +2389,9 @@ func (n NewTargetExpr) exprNode()  {}
 func (n ImportMetaExpr) exprNode() {}
 func (n NewExpr) exprNode()        {}
 func (n CallExpr) exprNode()       {}
-func (n OptChainExpr) exprNode()   {}
 func (n UnaryExpr) exprNode()      {}
 func (n BinaryExpr) exprNode()     {}
 func (n CondExpr) exprNode()       {}
 func (n YieldExpr) exprNode()      {}
 func (n ArrowFunc) exprNode()      {}
+func (n CommaExpr) exprNode()      {}

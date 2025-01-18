@@ -19,8 +19,9 @@ func TestTokens(t *testing.T) {
 		{" \t\v\f\u00A0\uFEFF\u2000", TTs{}}, // WhitespaceToken
 		{"\n\r\r\n\u2028\u2029", TTs{LineTerminatorToken}},
 		{"5.2 .04 1. 2.e3 0x0F 5e99", TTs{DecimalToken, DecimalToken, DecimalToken, DecimalToken, HexadecimalToken, DecimalToken}},
+		{"2_3 5_4.1_2 1_1n 0o2_3 0b1_1 0xF_F", TTs{IntegerToken, DecimalToken, IntegerToken, OctalToken, BinaryToken, HexadecimalToken}},
 		{"0o22 0b11", TTs{OctalToken, BinaryToken}},
-		{"0n 2345n 435.333n", TTs{BigIntToken, BigIntToken, DecimalToken, ErrorToken}},
+		{"0n 2345n 0o5n 0b1n 0x5n 435.333n", TTs{IntegerToken, IntegerToken, OctalToken, BinaryToken, HexadecimalToken, DecimalToken, ErrorToken}},
 		{"a = 'string'", TTs{IdentifierToken, EqToken, StringToken}},
 		{"/*comment*/ //comment", TTs{CommentToken, CommentToken}},
 		{"{ } ( ) [ ]", TTs{OpenBraceToken, CloseBraceToken, OpenParenToken, CloseParenToken, OpenBracketToken, CloseBracketToken}},
@@ -41,28 +42,29 @@ func TestTokens(t *testing.T) {
 		{"try typeof var void while with yield", TTs{TryToken, TypeofToken, VarToken, VoidToken, WhileToken, WithToken, YieldToken}},
 		{"implements interface let package private protected public static", TTs{ImplementsToken, InterfaceToken, LetToken, PackageToken, PrivateToken, ProtectedToken, PublicToken, StaticToken}},
 		{"as async from get meta of set target", TTs{AsToken, AsyncToken, FromToken, GetToken, MetaToken, OfToken, SetToken, TargetToken}},
+		{"#ident", TTs{PrivateIdentifierToken}},
 
 		{"/*co\nm\u2028m/*ent*/ //co//mment\u2029//comment", TTs{CommentLineTerminatorToken, CommentToken, LineTerminatorToken, CommentToken}},
 		{"<!-", TTs{LtToken, NotToken, SubToken}},
-		{"1<!--2\n", TTs{DecimalToken, CommentToken, LineTerminatorToken}},
-		{"x=y-->10\n", TTs{IdentifierToken, EqToken, IdentifierToken, DecrToken, GtToken, DecimalToken, LineTerminatorToken}},
+		{"1<!--2\n", TTs{IntegerToken, CommentToken, LineTerminatorToken}},
+		{"x=y-->10\n", TTs{IdentifierToken, EqToken, IdentifierToken, DecrToken, GtToken, IntegerToken, LineTerminatorToken}},
 		{"  /*comment*/ -->nothing\n", TTs{CommentToken, DecrToken, GtToken, IdentifierToken, LineTerminatorToken}},
-		{"1 /*comment\nmultiline*/ -->nothing\n", TTs{DecimalToken, CommentLineTerminatorToken, CommentToken, LineTerminatorToken}},
-		{"$ _\u200C \\u2000 \u200C", TTs{IdentifierToken, IdentifierToken, IdentifierToken, ErrorToken}},
+		{"1 /*comment\nmultiline*/ -->nothing\n", TTs{IntegerToken, CommentLineTerminatorToken, CommentToken, LineTerminatorToken}},
+		{"$ _\u200C \\u2000 _\\u200C \u200C", TTs{IdentifierToken, IdentifierToken, IdentifierToken, IdentifierToken, ErrorToken}},
 		{">>>=>>>>=", TTs{GtGtGtEqToken, GtGtGtToken, GtEqToken}},
-		{"1/", TTs{DecimalToken, DivToken}},
-		{"1/=", TTs{DecimalToken, DivEqToken}},
+		{"1/", TTs{IntegerToken, DivToken}},
+		{"1/=", TTs{IntegerToken, DivEqToken}},
 		{"'str\\i\\'ng'", TTs{StringToken}},
 		{"'str\\\\'abc", TTs{StringToken, IdentifierToken}},
 		{"'str\\\ni\\\\u00A0ng'", TTs{StringToken}},
 		{"'str\u2028\u2029ing'", TTs{StringToken}},
 
-		{"0b0101 0o0707 0b17", TTs{BinaryToken, OctalToken, BinaryToken, DecimalToken}},
+		{"0b0101 0o0707 0b17", TTs{BinaryToken, OctalToken, BinaryToken, IntegerToken}},
 		{"`template`", TTs{TemplateToken}},
 		{"`a${x+y}b`", TTs{TemplateStartToken, IdentifierToken, AddToken, IdentifierToken, TemplateEndToken}},
 		{"`tmpl${x}tmpl${x}`", TTs{TemplateStartToken, IdentifierToken, TemplateMiddleToken, IdentifierToken, TemplateEndToken}},
 		{"`temp\nlate`", TTs{TemplateToken}},
-		{"`outer${{x: 10}}bar${ raw`nested${2}endnest` }end`", TTs{TemplateStartToken, OpenBraceToken, IdentifierToken, ColonToken, DecimalToken, CloseBraceToken, TemplateMiddleToken, IdentifierToken, TemplateStartToken, DecimalToken, TemplateEndToken, TemplateEndToken}},
+		{"`outer${{x: 10}}bar${ raw`nested${2}endnest` }end`", TTs{TemplateStartToken, OpenBraceToken, IdentifierToken, ColonToken, IntegerToken, CloseBraceToken, TemplateMiddleToken, IdentifierToken, TemplateStartToken, IntegerToken, TemplateEndToken, TemplateEndToken}},
 		{"`tmpl ${ a ? '' : `tmpl2 ${b ? 'b' : 'c'}` }`", TTs{TemplateStartToken, IdentifierToken, QuestionToken, StringToken, ColonToken, TemplateStartToken, IdentifierToken, QuestionToken, StringToken, ColonToken, StringToken, TemplateEndToken, TemplateEndToken}},
 
 		// early endings
@@ -71,14 +73,14 @@ func TestTokens(t *testing.T) {
 		{"'\u2028", TTs{ErrorToken}},
 		{"'str\\\U00100000ing\\0'", TTs{StringToken}},
 		{"'strin\\00g'", TTs{StringToken}},
-		{"/*comment", TTs{CommentToken}},
+		{"/*comment", TTs{ErrorToken}},
 		{"a=/regexp", TTs{IdentifierToken, EqToken, DivToken, IdentifierToken}},
 		{"\\u002", TTs{ErrorToken}},
-		{"`template", TTs{TemplateToken}},
-		{"`template${x}template", TTs{TemplateStartToken, IdentifierToken, TemplateEndToken}},
-		{"a++=1", TTs{IdentifierToken, IncrToken, EqToken, DecimalToken}},
-		{"a++==1", TTs{IdentifierToken, IncrToken, EqEqToken, DecimalToken}},
-		{"a++===1", TTs{IdentifierToken, IncrToken, EqEqEqToken, DecimalToken}},
+		{"`template", TTs{ErrorToken}},
+		{"`template${x}template", TTs{TemplateStartToken, IdentifierToken, ErrorToken}},
+		{"a++=1", TTs{IdentifierToken, IncrToken, EqToken, IntegerToken}},
+		{"a++==1", TTs{IdentifierToken, IncrToken, EqEqToken, IntegerToken}},
+		{"a++===1", TTs{IdentifierToken, IncrToken, EqEqEqToken, IntegerToken}},
 
 		// null characters
 		{"'string\x00'return", TTs{StringToken, ReturnToken}},
@@ -88,10 +90,9 @@ func TestTokens(t *testing.T) {
 		{"`template\\\x00`return", TTs{TemplateToken, ReturnToken}},
 
 		// numbers
-		{"0xg", TTs{ErrorToken}},
-		{"0.f", TTs{DecimalToken, ErrorToken}},
-		{"0bg", TTs{ErrorToken}},
-		{"0og", TTs{ErrorToken}},
+		{"0xg", TTs{IntegerToken, ErrorToken}},
+		{"0bg", TTs{IntegerToken, ErrorToken}},
+		{"0og", TTs{IntegerToken, ErrorToken}},
 		{"010", TTs{ErrorToken}}, // Decimal(0) Decimal(10) Identifier(xF)
 		{"50e+-0", TTs{ErrorToken}},
 		{"5.a", TTs{DecimalToken, ErrorToken}},
@@ -113,7 +114,10 @@ func TestTokens(t *testing.T) {
 		{"`\\\r\n`", TTs{TemplateToken}},
 
 		// go fuzz
-		{"`", TTs{TemplateToken}},
+		{"`", TTs{ErrorToken}},
+
+		// issues
+		{"_\u00bare_unicode_escape_identifier", TTs{IdentifierToken}}, // tdewolff/minify#449
 	}
 
 	for _, tt := range tokenTests {
@@ -238,27 +242,32 @@ func TestOffset(t *testing.T) {
 }
 
 func TestLexerErrors(t *testing.T) {
-	l := NewLexer(parse.NewInputString("@"))
-	l.Next()
-	test.T(t, l.Err().(*parse.Error).Message, "unexpected @")
+	var tests = []struct {
+		js  string
+		err string
+	}{
+		{"@", "unexpected @"},
+		{"\x00", "unexpected 0x00"},
+		{"\x7f", "unexpected 0x7F"},
+		{"\u200F", "unexpected U+200F"},
+		{"\u2010", "unexpected \u2010"},
+		{".0E", "invalid number"},
+		{`"a`, "unterminated string literal"},
+		{"'a\nb'", "unterminated string literal"},
+		{"`", "unterminated template literal"},
+	}
 
-	l = NewLexer(parse.NewInputString("\x00"))
-	l.Next()
-	test.T(t, l.Err().(*parse.Error).Message, "unexpected 0x00")
+	for _, tt := range tests {
+		t.Run(tt.js, func(t *testing.T) {
+			l := NewLexer(parse.NewInputString(tt.js))
+			for l.Err() == nil {
+				l.Next()
+			}
+			test.T(t, l.Err().(*parse.Error).Message, tt.err)
+		})
+	}
 
-	l = NewLexer(parse.NewInputString("\x7f"))
-	l.Next()
-	test.T(t, l.Err().(*parse.Error).Message, "unexpected 0x7F")
-
-	l = NewLexer(parse.NewInputString("\u200F"))
-	l.Next()
-	test.T(t, l.Err().(*parse.Error).Message, "unexpected U+200F")
-
-	l = NewLexer(parse.NewInputString("\u2010"))
-	l.Next()
-	test.T(t, l.Err().(*parse.Error).Message, "unexpected \u2010")
-
-	l = NewLexer(parse.NewInputString(""))
+	l := NewLexer(parse.NewInputString(""))
 	l.RegExp()
 	test.T(t, l.Err().(*parse.Error).Message, "expected / or /=")
 
@@ -267,15 +276,15 @@ func TestLexerErrors(t *testing.T) {
 	l.RegExp()
 	test.T(t, l.Err().(*parse.Error).Message, "unexpected EOF or newline")
 
-	l = NewLexer(parse.NewInputString("5a"))
-	l.Next()
-	l.Next()
-	test.T(t, l.Err().(*parse.Error).Message, "unexpected identifier after number")
-
-	l = NewLexer(parse.NewInputString(".0E"))
-	l.Next()
-	l.Next()
-	test.T(t, l.Err().(*parse.Error).Message, "invalid number")
+	// see #118
+	l = NewLexer(parse.NewInputString("\uFFFDa"))
+	tt, data := l.Next()
+	test.T(t, tt, ErrorToken)
+	test.T(t, string(data), "�")
+	test.T(t, l.Err().(*parse.Error).Message, "unexpected �")
+	tt, data = l.Next()
+	test.T(t, tt, IdentifierToken)
+	test.T(t, string(data), "a")
 }
 
 ////////////////////////////////////////////////////////////////
