@@ -12,7 +12,7 @@ import (
 type TTs []TokenType
 
 func TestTokens(t *testing.T) {
-	var tokenTests = []struct {
+	var tests = []struct {
 		html     string
 		expected []TokenType
 	}{
@@ -79,7 +79,7 @@ func TestTokens(t *testing.T) {
 		// go-fuzz
 		{"</>", TTs{TextToken}},
 	}
-	for _, tt := range tokenTests {
+	for _, tt := range tests {
 		t.Run(tt.html, func(t *testing.T) {
 			l := NewLexer(parse.NewInputString(tt.html))
 			i := 0
@@ -106,7 +106,7 @@ func TestTokens(t *testing.T) {
 }
 
 func TestTags(t *testing.T) {
-	var tagTests = []struct {
+	var tests = []struct {
 		html     string
 		expected string
 	}{
@@ -118,7 +118,7 @@ func TestTags(t *testing.T) {
 		// early endings
 		{"<foo ", "foo"},
 	}
-	for _, tt := range tagTests {
+	for _, tt := range tests {
 		t.Run(tt.html, func(t *testing.T) {
 			l := NewLexer(parse.NewInputString(tt.html))
 			for {
@@ -137,7 +137,7 @@ func TestTags(t *testing.T) {
 }
 
 func TestAttributes(t *testing.T) {
-	var attributeTests = []struct {
+	var tests = []struct {
 		attr     string
 		expected []string
 	}{
@@ -157,7 +157,7 @@ func TestAttributes(t *testing.T) {
 		{"<foo \x00=\x00>", []string{"\x00", "\x00"}},
 		{"<foo \x00='\x00'>", []string{"\x00", "'\x00'"}},
 	}
-	for _, tt := range attributeTests {
+	for _, tt := range tests {
 		t.Run(tt.attr, func(t *testing.T) {
 			l := NewLexer(parse.NewInputString(tt.attr))
 			i := 0
@@ -170,7 +170,7 @@ func TestAttributes(t *testing.T) {
 				} else if token == AttributeToken {
 					test.That(t, i+1 < len(tt.expected), "index", i+1, "must not exceed expected attributes size", len(tt.expected))
 					if i+1 < len(tt.expected) {
-						test.String(t, string(l.Text()), tt.expected[i], "attribute keys must match")
+						test.String(t, string(l.AttrKey()), tt.expected[i], "attribute keys must match")
 						test.String(t, string(l.AttrVal()), tt.expected[i+1], "attribute keys must match")
 						i += 2
 					}
@@ -180,15 +180,47 @@ func TestAttributes(t *testing.T) {
 	}
 }
 
+func TestTemplates(t *testing.T) {
+	var tests = []struct {
+		html string
+		tmpl []bool
+	}{
+		{"<p>{{.}}</p>", []bool{true}},
+		{"<p> {{.}} </p>", []bool{true}},
+		{"<input type='{{.}}'/>", []bool{true}},
+		{"<input type={{.}} />", []bool{true}},
+		{"<input {{if eq .Type 0}}selected{{end}}>", []bool{true}},
+		{"<input {{if eq .Type 0}} selected {{end}}>", []bool{true, false, true}},
+		{"{{", []bool{true}},
+		{"{{'", []bool{true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.html, func(t *testing.T) {
+			l := NewTemplateLexer(parse.NewInputString(tt.html), GoTemplate)
+			tmpl := []bool{}
+			for {
+				token, _ := l.Next()
+				if token == ErrorToken {
+					test.T(t, l.Err(), io.EOF)
+					break
+				} else if token == TextToken || token == AttributeToken {
+					tmpl = append(tmpl, l.HasTemplate())
+				}
+			}
+			test.T(t, tmpl, tt.tmpl, "HasTemplate must match")
+		})
+	}
+}
+
 func TestErrors(t *testing.T) {
-	var errorTests = []struct {
+	var tests = []struct {
 		html string
 		col  int
 	}{
 		{"<svg>\x00</svg>", 6},
 		{"<svg></svg\x00>", 11},
 	}
-	for _, tt := range errorTests {
+	for _, tt := range tests {
 		t.Run(tt.html, func(t *testing.T) {
 			l := NewLexer(parse.NewInputString(tt.html))
 			for {
@@ -218,7 +250,7 @@ func TestTextAndAttrVal(t *testing.T) {
 
 	_, data = l.Next()
 	test.Bytes(t, data, []byte(` attr="val"`))
-	test.Bytes(t, l.Text(), []byte("attr"))
+	test.Bytes(t, l.AttrKey(), []byte("attr"))
 	test.Bytes(t, l.AttrVal(), []byte(`"val"`))
 
 	_, data = l.Next()
@@ -258,7 +290,7 @@ func TestTextAndAttrVal(t *testing.T) {
 
 	_, data = l.Next()
 	test.Bytes(t, data, []byte("js"))
-	test.Bytes(t, l.Text(), nil)
+	test.Bytes(t, l.Text(), []byte("js"))
 	test.Bytes(t, l.AttrVal(), nil)
 
 	_, data = l.Next()

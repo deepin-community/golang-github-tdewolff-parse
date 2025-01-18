@@ -2,6 +2,7 @@ package js
 
 import (
 	"bytes"
+	"regexp"
 	"testing"
 
 	"github.com/tdewolff/parse/v2"
@@ -31,15 +32,18 @@ func TestWalk(t *testing.T) {
 		}
 	}`
 
-	ast, err := Parse(parse.NewInputString(js))
+	ast, err := Parse(parse.NewInputString(js), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	Walk(&walker{}, ast)
 
+	re := regexp.MustCompile("\n *")
 	t.Run("TestWalk", func(t *testing.T) {
-		test.String(t, ast.JS(), "if (true) { for (i = 0; i < 1; i++) { obj.y = i; }; }; ")
+		src := ast.JSString()
+		src = re.ReplaceAllString(src, " ")
+		test.String(t, src, "if (true) { for (i = 0; i < 1; i++) { obj.y = i; } }")
 	})
 }
 
@@ -78,7 +82,8 @@ func TestWalkNilNode(t *testing.T) {
 		&Params{},
 		&FuncDecl{},
 		&MethodDecl{},
-		&FieldDefinition{},
+		&Field{},
+		&ClassElement{},
 		&ClassDecl{},
 		&LiteralExpr{},
 		&Element{},
@@ -96,7 +101,6 @@ func TestWalkNilNode(t *testing.T) {
 		&Args{},
 		&NewExpr{},
 		&CallExpr{},
-		&OptChainExpr{},
 		&UnaryExpr{},
 		&BinaryExpr{},
 		&CondExpr{},
